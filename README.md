@@ -5,6 +5,14 @@ a destination, a method, a schedule and a rule for what to keep. Scheduled
 jobs run as Windows scheduled tasks in the background, so RoboGUI doesn't need
 to be open. When you open it, it shows what ran and whether it worked.
 
+## Download
+
+Get `robogui.exe` from the [latest release](https://github.com/nilsfriden/robogui/releases/latest).
+It's a single file with nothing to install. Windows 10/11, 64-bit.
+
+Put it in a permanent folder before you set up schedules: the scheduled tasks
+start the exe from wherever it is.
+
 ## Build
 
     cargo build --release
@@ -42,3 +50,7 @@ Every robocopy option has plain-language hover help in the app.
     %APPDATA%\RoboGUI\jobs.json         jobs
     %APPDATA%\RoboGUI\state\<id>.json   run history (last 50 runs)
     %APPDATA%\RoboGUI\logs\<id>.log     log
+
+## License
+
+MIT, see [LICENSE](LICENSE).
