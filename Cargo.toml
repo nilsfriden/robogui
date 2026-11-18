@@ -1,0 +1,25 @@
+[package]
+name = "robogui"
+version = "0.2.0"
+edition = "2021"
+description = "Folder backup tool: dated zip copies or robocopy mirrors, scheduled with Task Scheduler"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+rfd = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Globalization", "Win32_System_Console"] }
+
+# Only so the project also builds on Linux for testing; Windows needs no extra backend.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["x11"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
