@@ -7,18 +7,23 @@ to be open. When you open it, it shows what ran and whether it worked.
 
 ## Download
 
-Get `robogui.exe` from the [latest release](https://github.com/nilsfriden/robogui/releases/latest).
+Get `robogui-vX.Y.Z.exe` from the [latest release](https://github.com/nilsfriden/robogui/releases/latest).
 It's a single file with nothing to install. Windows 10/11, 64-bit.
 
 Put it in a permanent folder before you set up schedules: the scheduled tasks
 start the exe from wherever it is.
 
+**Updating:** open the new version once. It moves the scheduled tasks over to
+itself, and then you can delete the old exe. Don't open an old version again
+afterwards, or it takes the tasks back.
+
 ## Build
 
     cargo build --release
 
-Run `target\release\robogui.exe`. Leave it where it is, or move it and open it
-once: on start, RoboGUI re-points the scheduled tasks at its current location.
+Cargo builds `target\release\robogui.exe`. Releases rename it to
+`robogui-v<version>.exe`, with the version from `Cargo.toml`. On start,
+RoboGUI re-points the scheduled tasks at whichever exe is running.
 
 ## Methods
 
