@@ -13,9 +13,11 @@ It's a single file with nothing to install. Windows 10/11, 64-bit.
 Put it in a permanent folder before you set up schedules: the scheduled tasks
 start the exe from wherever it is.
 
-**Updating:** open the new version once. It moves the scheduled tasks over to
-itself, and then you can delete the old exe. Don't open an old version again
-afterwards, or it takes the tasks back.
+**Updating:** open the new version. Jobs whose scheduled task still starts the
+old exe say "The schedule starts another copy of RoboGUI"; press **Fix** on
+each, then you can delete the old exe. RoboGUI never changes scheduled tasks
+on its own at startup (antivirus treats that as suspicious, and it should be
+your call).
 
 ## Build
 
@@ -23,7 +25,7 @@ afterwards, or it takes the tasks back.
 
 Cargo builds `target\release\robogui.exe`. Releases rename it to
 `robogui-v<version>.exe`, with the version from `Cargo.toml`. On start,
-RoboGUI re-points the scheduled tasks at whichever exe is running.
+RoboGUI shows a Fix button for tasks that start a different exe.
 
 ## Methods
 
@@ -57,8 +59,8 @@ Every robocopy option has plain-language hover help in the app.
   as it's back.
 - If the backup drive is missing, a scheduled run retries 3 times, 5 minutes
   apart, before it counts as failed.
-- On start, the app checks that each task still exists in Windows and flags
-  missed runs ("The backup due today at 04:00 didn't run").
+- On start, the app checks that each task still exists in Windows and starts
+  this exe (offering Fix if not), and flags missed runs ("The backup due today at 04:00 didn't run").
 
 ## Files
 

@@ -100,7 +100,8 @@ struct Status {
     scheduled: String,
 }
 
-fn job_status(job: &Job, state: &State, task: Option<&TaskInfo>, now: NaiveDateTime) -> Status {
+/// `stale`: the command of a scheduled task that starts another copy of RoboGUI.
+fn job_status(job: &Job, state: &State, task: Option<&TaskInfo>, stale: Option<&String>, now: NaiveDateTime) -> Status {
     let scheduled = if job.schedule.enabled || state.last_scheduled().is_some() {
         match state.last_scheduled() {
             Some(r) => {
@@ -137,8 +138,21 @@ fn job_status(job: &Job, state: &State, task: Option<&TaskInfo>, now: NaiveDateT
         return mk(
             Tone::Warn,
             "The scheduled task is missing in Windows".into(),
-            "Turn automatic backup off and on again to recreate it.".into(),
+            "Press Fix to create it again.".into(),
             "Task missing",
+        );
+    }
+    if let Some(cmd) = stale {
+        let old_exe = cmd.split(" --run").next().unwrap_or(cmd).trim().trim_matches('"');
+        let gone = !std::path::Path::new(old_exe).is_file();
+        return mk(
+            if gone { Tone::Error } else { Tone::Warn },
+            "The schedule starts another copy of RoboGUI".into(),
+            format!(
+                "It runs {old_exe}{} Press Fix to make it start this copy.",
+                if gone { ", which no longer exists, so scheduled backups fail." } else { "." }
+            ),
+            "Needs fix",
         );
     }
     let Some(last) = last else {
@@ -230,6 +244,9 @@ struct App {
     elevated: bool,
     /// Progress of runs going on in another process (scheduled task), by job id.
     bg: HashMap<String, String>,
+    /// Jobs whose scheduled task starts another copy of RoboGUI: job id ->
+    /// the command the task runs now.
+    stale: HashMap<String, String>,
 }
 
 impl App {
@@ -257,6 +274,7 @@ impl App {
             resolve_lib: store::find_resolve_library(),
             elevated: image::is_elevated(),
             bg: HashMap::new(),
+            stale: HashMap::new(),
         };
         app.reload_states();
         app.check_tasks();
@@ -276,26 +294,35 @@ impl App {
         }
     }
 
-    /// Ask Task Scheduler about every scheduled job. If a task is missing
-    /// or points at an old copy of this program (exe moved), re-register it.
+    /// Ask Task Scheduler about every scheduled job and note the ones whose
+    /// task is missing or starts another copy of this program (exe moved or
+    /// updated). Nothing is changed here: the user fixes it with a click, so
+    /// RoboGUI never edits scheduled tasks behind their back.
     fn check_tasks(&mut self) {
         let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let mut changed = false;
-        for j in self.cfg.jobs.iter_mut() {
+        self.stale.clear();
+        for j in &self.cfg.jobs {
             if !(j.schedule.enabled && j.is_complete()) {
                 continue;
             }
-            let mut info = sched::query(&j.task_name);
-            if !info.exists || !info.command.to_lowercase().contains(&exe) {
-                if sched::sync(j).is_ok() {
-                    changed = true;
-                    info = sched::query(&j.task_name);
-                }
+            let info = sched::query(&j.task_name);
+            if info.exists && !info.command.to_lowercase().contains(&exe) {
+                self.stale.insert(j.id.clone(), info.command.clone());
             }
             self.tasks.insert(j.id.clone(), info);
         }
-        if changed {
-            self.save();
+    }
+
+    /// "Fix": register job `i`'s task again so it starts this program.
+    fn fix_task(&mut self, i: usize) {
+        self.notice = None;
+        self.commit(i);
+        let id = self.cfg.jobs[i].id.clone();
+        if self.tasks.get(&id).is_some_and(|t| t.exists) && !matches!(self.notice, Some((Tone::Error, _))) {
+            self.stale.remove(&id);
+            if self.notice.is_none() {
+                self.notice = Some((Tone::Ok, "Scheduled task fixed: it now starts this copy of RoboGUI.".into()));
+            }
         }
     }
 
@@ -530,7 +557,7 @@ impl App {
         let dark = ui.visuals().dark_mode;
         let mut clicked = None;
         for (i, j) in self.cfg.jobs.iter().enumerate() {
-            let st = job_status(j, self.states.get(&j.id).unwrap_or(&State::default()), self.tasks.get(&j.id), now);
+            let st = job_status(j, self.states.get(&j.id).unwrap_or(&State::default()), self.tasks.get(&j.id), self.stale.get(&j.id), now);
             let selected = self.sel == Some(i);
             let fill = if selected { ui.visuals().selection.bg_fill.gamma_multiply(0.35) } else { Color32::TRANSPARENT };
             let resp = egui::Frame::new().fill(fill).corner_radius(6.0).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
@@ -598,7 +625,9 @@ impl App {
         let dark = ui.visuals().dark_mode;
         let running = self.run.as_ref().filter(|r| r.job_id == job.id);
         let background = self.bg.get(&job.id).cloned();
-        let st = job_status(job, self.states.get(&job.id).unwrap_or(&State::default()), self.tasks.get(&job.id), now);
+        let st = job_status(job, self.states.get(&job.id).unwrap_or(&State::default()), self.tasks.get(&job.id), self.stale.get(&job.id), now);
+        let needs_fix = job.schedule.enabled && job.is_complete() && (self.stale.contains_key(&job.id) || self.tasks.get(&job.id).is_some_and(|t| !t.exists));
+        let mut fix = false;
         let tone = if running.is_some() || background.is_some() { Tone::Neutral } else { st.tone };
         let (bg, fg) = tone_colors(tone, dark);
         let can_run = job.problem().is_none() && !self.busy() && background.is_none();
@@ -654,12 +683,23 @@ impl App {
                         if b.clicked() {
                             start = true;
                         }
+                        if needs_fix
+                            && ui
+                                .add_enabled(!self.busy(), egui::Button::new("Fix").min_size(egui::vec2(60.0, 30.0)))
+                                .on_hover_text("Registers this job's scheduled task in Windows again, so it starts this copy of RoboGUI.")
+                                .clicked()
+                        {
+                            fix = true;
+                        }
                     });
                 });
             }
         });
         if start {
             self.back_up_now(ui.ctx(), i);
+        }
+        if fix {
+            self.fix_task(i);
         }
         if stop {
             if let Some(r) = &self.run {
