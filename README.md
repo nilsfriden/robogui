@@ -1,4 +1,4 @@
-# RoboGUI v0.2.0
+# RoboGUI v0.3.0
 
 A folder backup tool for Windows (Rust + egui). Each backup job is a folder,
 a destination, a method, a schedule and a rule for what to keep. Scheduled
@@ -34,6 +34,16 @@ RoboGUI re-points the scheduled tasks at whichever exe is running.
 - **Mirror (exact copy)**: robocopy /MIR. Deletes files from the backup that
   were deleted from the source. No history.
 - **Copy, never delete**: robocopy /E. Never deletes anything in the backup.
+- **Full drive image (Windows Backup)**: `wbadmin start backup -include:C:
+  -allCritical`, a bootable image of a whole drive taken from a snapshot.
+  After the first run only changed blocks are stored. Older versions are kept
+  as shadow copies on the backup drive, capped at a share of it (Keep, default
+  50 %); when that's full Windows deletes the oldest first. Needs admin: open
+  RoboGUI as administrator to set it up (there's a button), and the scheduled
+  task then runs with highest privileges. Without admin, Back up now starts
+  the scheduled task, and the window follows its progress. The list of image
+  versions is read after each run. Restore with Windows Recovery > System
+  Image Recovery.
 
 Every robocopy option has plain-language hover help in the app.
 
@@ -55,6 +65,8 @@ Every robocopy option has plain-language hover help in the app.
     %APPDATA%\RoboGUI\jobs.json         jobs
     %APPDATA%\RoboGUI\state\<id>.json   run history (last 50 runs)
     %APPDATA%\RoboGUI\logs\<id>.log     log
+    %APPDATA%\RoboGUI\state\<id>.progress        progress of a running job
+    %APPDATA%\RoboGUI\state\<id>.versions.json   drive image versions
 
 ## License
 

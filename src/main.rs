@@ -1,4 +1,4 @@
-// RoboGUI v0.2.0 - folder backup tool with scheduled background runs.
+// RoboGUI v0.3.0 - folder backup tool with scheduled background runs.
 //
 //   robogui.exe              opens the window
 //   robogui.exe --run <id>   runs one backup job without a window
@@ -6,6 +6,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod engine;
+mod image;
 mod robo;
 mod runner;
 mod sched;
@@ -168,7 +169,7 @@ fn job_status(job: &Job, state: &State, task: Option<&TaskInfo>, now: NaiveDateT
     mk(
         Tone::Ok,
         format!("Backed up {when}"),
-        format!("{} · {how} · {next}", if last.size > 0 { human_bytes(last.size) } else { last.message.clone() }),
+        format!("{} Â· {how} Â· {next}", if last.size > 0 { human_bytes(last.size) } else { last.message.clone() }),
         &short_when,
     )
 }
@@ -225,6 +226,10 @@ struct App {
     open_details: bool,
     last_poll: Instant,
     resolve_lib: Option<PathBuf>,
+    /// This window runs with administrator rights.
+    elevated: bool,
+    /// Progress of runs going on in another process (scheduled task), by job id.
+    bg: HashMap<String, String>,
 }
 
 impl App {
@@ -250,6 +255,8 @@ impl App {
             open_details: false,
             last_poll: Instant::now(),
             resolve_lib: store::find_resolve_library(),
+            elevated: image::is_elevated(),
+            bg: HashMap::new(),
         };
         app.reload_states();
         app.check_tasks();
@@ -257,8 +264,15 @@ impl App {
     }
 
     fn reload_states(&mut self) {
+        self.bg.clear();
+        let own = self.run.as_ref().map(|r| r.job_id.clone());
         for j in &self.cfg.jobs {
             self.states.insert(j.id.clone(), store::load_state(&j.id));
+            if own.as_deref() != Some(j.id.as_str()) {
+                if let Some(p) = store::background_progress(&j.id) {
+                    self.bg.insert(j.id.clone(), p);
+                }
+            }
         }
     }
 
@@ -329,7 +343,34 @@ impl App {
         self.live_log.clear();
         self.restored = None;
         self.notice = None;
-        self.run = Some(Running { job_id: self.cfg.jobs[i].id.clone(), kind: RunKind::Backup, rx, ctl, phase: "Starting…".into(), total: None, done: (0, 0) });
+        self.run = Some(Running { job_id: self.cfg.jobs[i].id.clone(), kind: RunKind::Backup, rx, ctl, phase: "Startingâ€¦".into(), total: None, done: (0, 0) });
+    }
+
+    /// "Back up now". A drive image needs admin: without it, start the job's
+    /// scheduled task instead (it has the rights) and follow its progress.
+    fn back_up_now(&mut self, ctx: &egui::Context, i: usize) {
+        let job = &self.cfg.jobs[i];
+        if job.method != Method::Image || self.elevated {
+            self.start_backup(ctx, i);
+            return;
+        }
+        let id = job.id.clone();
+        let has_task = self.tasks.get(&id).is_some_and(|t| t.exists);
+        if !has_task {
+            self.notice = Some((
+                Tone::Warn,
+                "A drive image needs administrator rights. Press \"Open as administrator\", or turn on automatic backup there once; after that, Back up now works from here too.".into(),
+            ));
+            return;
+        }
+        match sched::run_now(&job.task_name) {
+            Ok(()) => {
+                self.notice = Some((Tone::Ok, "Started in the background with administrator rights. Progress shows here; you can close RoboGUI.".into()));
+                self.bg.insert(id, "Startingâ€¦".into());
+                self.last_poll = Instant::now();
+            }
+            Err(e) => self.notice = Some((Tone::Error, format!("Couldn't start the scheduled task: {e}"))),
+        }
     }
 
     fn start_restore(&mut self, ctx: &egui::Context, i: usize, zip: PathBuf, into: PathBuf) {
@@ -348,12 +389,13 @@ impl App {
         self.live_log.clear();
         self.restored = None;
         self.notice = None;
-        self.run = Some(Running { job_id: self.cfg.jobs[i].id.clone(), kind: RunKind::Restore, rx, ctl, phase: "Opening backup…".into(), total: None, done: (0, 0) });
+        self.run = Some(Running { job_id: self.cfg.jobs[i].id.clone(), kind: RunKind::Restore, rx, ctl, phase: "Opening backupâ€¦".into(), total: None, done: (0, 0) });
     }
 
     fn poll(&mut self) {
         // Pick up runs finished by the scheduler while the window is open.
-        if self.last_poll.elapsed() > Duration::from_secs(5) {
+        let every = if self.bg.is_empty() { 5 } else { 2 };
+        if self.last_poll.elapsed() > Duration::from_secs(every) {
             self.last_poll = Instant::now();
             if !self.busy() {
                 self.reload_states();
@@ -495,7 +537,12 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new(&j.name).strong());
                 let (_, fg) = tone_colors(st.tone, dark);
-                let busy_text = self.run.as_ref().filter(|r| r.job_id == j.id).map(|r| if r.kind == RunKind::Restore { "Restoring…" } else { "Backing up…" });
+                let busy_text = self
+                    .run
+                    .as_ref()
+                    .filter(|r| r.job_id == j.id)
+                    .map(|r| if r.kind == RunKind::Restore { "Restoringâ€¦" } else { "Backing upâ€¦" })
+                    .or_else(|| self.bg.contains_key(&j.id).then_some("Backing upâ€¦"));
                 ui.horizontal(|ui| {
                     if let Some(t) = busy_text {
                         ui.add(egui::Spinner::new().size(10.0));
@@ -539,7 +586,7 @@ impl App {
                 self.new_job(true);
             }
             ui.add_space(6.0);
-            if ui.button("Choose another folder…").clicked() {
+            if ui.button("Choose another folderâ€¦").clicked() {
                 self.new_job(false);
             }
         });
@@ -550,10 +597,11 @@ impl App {
         let job = &self.cfg.jobs[i];
         let dark = ui.visuals().dark_mode;
         let running = self.run.as_ref().filter(|r| r.job_id == job.id);
+        let background = self.bg.get(&job.id).cloned();
         let st = job_status(job, self.states.get(&job.id).unwrap_or(&State::default()), self.tasks.get(&job.id), now);
-        let tone = if running.is_some() { Tone::Neutral } else { st.tone };
+        let tone = if running.is_some() || background.is_some() { Tone::Neutral } else { st.tone };
         let (bg, fg) = tone_colors(tone, dark);
-        let can_run = job.problem().is_none() && !self.busy();
+        let can_run = job.problem().is_none() && !self.busy() && background.is_none();
         let mut start = false;
         let mut stop = false;
         egui::Frame::new().fill(bg).corner_radius(8.0).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
@@ -570,14 +618,27 @@ impl App {
                 });
                 if let Some((files, bytes)) = r.total {
                     let frac = if bytes > 0 { r.done.1 as f32 / bytes as f32 } else if files > 0 { r.done.0 as f32 / files as f32 } else { 1.0 };
-                    ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).text(format!(
-                        "{} of {} files · {} of {}",
-                        r.done.0,
-                        files,
-                        human_bytes(r.done.1),
-                        human_bytes(bytes)
-                    )));
+                    // Drive images report a percentage only (total 100, no files).
+                    let text = if files == 0 && bytes == 100 {
+                        format!("{}%", r.done.1)
+                    } else {
+                        format!("{} of {} files Â· {} of {}", r.done.0, files, human_bytes(r.done.1), human_bytes(bytes))
+                    };
+                    ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).text(text));
                 }
+            } else if let Some(p) = &background {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Backing up in the background").color(fg).size(16.0).strong());
+                        ui.label(RichText::new(p).color(fg));
+                    });
+                });
+                let pct = p.rsplit(' ').next().and_then(|w| w.strip_suffix('%')).and_then(|n| n.parse::<f32>().ok());
+                if let Some(pct) = pct {
+                    ui.add(egui::ProgressBar::new((pct / 100.0).clamp(0.0, 1.0)).text(format!("{pct}%")));
+                }
+                ui.label(RichText::new("Started by Windows Task Scheduler. You can close RoboGUI; the result shows up here when it's done.").color(fg).size(12.5));
             } else {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
@@ -598,7 +659,7 @@ impl App {
             }
         });
         if start {
-            self.start_backup(ui.ctx(), i);
+            self.back_up_now(ui.ctx(), i);
         }
         if stop {
             if let Some(r) = &self.run {
@@ -615,6 +676,25 @@ impl App {
         });
         ui.add_space(6.0);
         self.status_card(ui, i);
+        if self.cfg.jobs[i].method == Method::Image && !self.elevated {
+            let has_task = self.tasks.get(&self.cfg.jobs[i].id).is_some_and(|t| t.exists);
+            ui.horizontal_wrapped(|ui| {
+                let text = if has_task {
+                    "Drive images run with administrator rights through the schedule. To change this job's settings, open RoboGUI as administrator."
+                } else {
+                    "A drive image needs administrator rights to set up. Open RoboGUI as administrator once and turn on automatic backup; after that it runs on its own."
+                };
+                ui.label(RichText::new(text).weak());
+                if ui.button("Open as administrator").clicked() {
+                    self.save();
+                    if image::relaunch_as_admin() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        self.notice = Some((Tone::Warn, "Windows didn't start RoboGUI as administrator.".into()));
+                    }
+                }
+            });
+        }
         if let Some((tone, text)) = self.notice.clone() {
             let (_, fg) = tone_colors(tone, ui.visuals().dark_mode);
             ui.horizontal_wrapped(|ui| {
@@ -723,13 +803,20 @@ impl App {
         if self.edit == Some(Field::Source) {
             editor_frame(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut job.source).desired_width(ui.available_width() - 90.0).hint_text("Folder to back up"));
-                    if ui.button("Browse…").clicked() {
-                        if let Some(p) = pick_folder(&job.source, "Folder to back up") {
+                    let hint = if job.method == Method::Image { "Drive to back up, like C:" } else { "Folder to back up" };
+                    ui.add(egui::TextEdit::singleline(&mut job.source).desired_width(ui.available_width() - 90.0).hint_text(hint));
+                    if ui.button("Browseâ€¦").clicked() {
+                        if let Some(p) = pick_folder(&job.source, hint) {
                             job.source = p;
                         }
                     }
                 });
+                if job.method == Method::Image {
+                    if let Some(d) = store::drive_of(&job.source) {
+                        job.source = d;
+                    }
+                    ui.label(RichText::new("The whole drive is imaged, plus whatever Windows needs to start (boot and recovery partitions).").small().weak());
+                }
                 if let Some(lib) = &resolve_lib {
                     let lib_s = lib.display().to_string();
                     if job.source != lib_s && ui.link("Use the DaVinci Resolve project library").on_hover_text(&lib_s).clicked() {
@@ -758,13 +845,20 @@ impl App {
         if self.edit == Some(Field::Dest) {
             editor_frame(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut job.dest).desired_width(ui.available_width() - 90.0).hint_text("Where to save the backup"));
-                    if ui.button("Browse…").clicked() {
-                        if let Some(p) = pick_folder(&job.dest, "Where to save the backup") {
+                    let hint = if job.method == Method::Image { "Backup drive, like H:" } else { "Where to save the backup" };
+                    ui.add(egui::TextEdit::singleline(&mut job.dest).desired_width(ui.available_width() - 90.0).hint_text(hint));
+                    if ui.button("Browseâ€¦").clicked() {
+                        if let Some(p) = pick_folder(&job.dest, hint) {
                             job.dest = p;
                         }
                     }
                 });
+                if job.method == Method::Image {
+                    if let Some(d) = store::drive_of(&job.dest) {
+                        job.dest = d;
+                    }
+                    ui.label(RichText::new("Windows saves the image in a WindowsImageBackup folder on this drive. Best on a drive used only for backups.").small().weak());
+                }
                 if let Some(p) = job.problem() {
                     ui.colored_label(ui.visuals().warn_fg_color, p);
                 }
@@ -776,6 +870,7 @@ impl App {
             Method::Zip => help::ZIP,
             Method::Mirror => help::MIRROR,
             Method::Copy => help::COPY,
+            Method::Image => help::IMAGE,
         };
         if row(ui, "How", job.method.label(), Some(method_help), editing == Some(Field::How)) {
             commit |= toggle(&mut self.edit, Field::How);
@@ -785,10 +880,29 @@ impl App {
                 ui.radio_value(&mut job.method, Method::Zip, Method::Zip.label()).on_hover_text(help::ZIP);
                 ui.radio_value(&mut job.method, Method::Mirror, Method::Mirror.label()).on_hover_text(help::MIRROR);
                 ui.radio_value(&mut job.method, Method::Copy, Method::Copy.label()).on_hover_text(help::COPY);
+                let was_image = job.method == Method::Image;
+                ui.radio_value(&mut job.method, Method::Image, Method::Image.label()).on_hover_text(help::IMAGE);
+                if job.method == Method::Image && !was_image {
+                    // Start from sensible drives: the folder's drive (or C:) and the backup's drive.
+                    job.source = store::drive_of(&job.source).unwrap_or_else(|| "C:".into());
+                    job.dest = store::drive_of(&job.dest).unwrap_or_default();
+                    if job.name == "New backup" || job.name.trim().is_empty() {
+                        job.name = format!("{} drive image", job.source);
+                    }
+                }
                 ui.add_space(4.0);
                 match job.method {
                     Method::Zip => {
                         ui.label(RichText::new(format!("Files are named like {}_2026-11-18_0400.zip", job.prefix)).small().weak());
+                    }
+                    Method::Image => {
+                        if let (Some(s), Some(d)) = (store::drive_of(&job.source), store::drive_of(&job.dest)) {
+                            let cmd = format!("wbadmin {}", image::wbadmin_args(&s, &d).join(" "));
+                            ui.label(RichText::new(cmd).monospace().small());
+                        }
+                        if !self.elevated {
+                            ui.colored_label(ui.visuals().warn_fg_color, "Needs administrator rights to set up: use \"Open as administrator\" above.");
+                        }
                     }
                     Method::Mirror | Method::Copy => {
                         if job.method == Method::Mirror {
@@ -886,7 +1000,7 @@ impl App {
         // Retention (zip only)
         if job.method == Method::Zip {
             let keep_text = format!("Last {} backups and {} weekly copies", job.keep_daily.max(1), job.keep_weekly);
-            let keep_help = "After each backup, older zips are deleted except:\n• the newest N backups\n• the newest backup from each of the last N Sundays\nSo with 7 and 4 you can go back a week day by day, and a month week by week.";
+            let keep_help = "After each backup, older zips are deleted except:\nâ€¢ the newest N backups\nâ€¢ the newest backup from each of the last N Sundays\nSo with 7 and 4 you can go back a week day by day, and a month week by week.";
             if row(ui, "Keep", keep_text, Some(keep_help), editing == Some(Field::Keep)) {
                 commit |= toggle(&mut self.edit, Field::Keep);
             }
@@ -904,8 +1018,34 @@ impl App {
                 });
             }
         }
+        if job.method == Method::Image {
+            let d = store::drive_of(&job.dest).unwrap_or_else(|| "the backup drive".into());
+            let keep_text = format!("As many versions as fit in {}% of {d}", job.image_space_pct);
+            let keep_help = "Every image after the first only stores what changed. Older versions are kept until they fill this share of the backup drive; then Windows deletes the oldest first, so you always have the most recent ones.\nThe newest version is always a complete image.";
+            if row(ui, "Keep", keep_text, Some(keep_help), editing == Some(Field::Keep)) {
+                commit |= toggle(&mut self.edit, Field::Keep);
+            }
+            if self.edit == Some(Field::Keep) {
+                editor_frame(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Older versions may use up to");
+                        ui.add(egui::DragValue::new(&mut job.image_space_pct).range(10..=90).suffix(" %"));
+                        ui.label(format!("of {d}"));
+                    })
+                    .response
+                    .on_hover_text(keep_help);
+                    ui.label(RichText::new("Applied at the start of each backup.").small().weak());
+                });
+            }
+        }
 
-        // Exclusions
+        // Exclusions (a drive image always takes the whole drive)
+        if job.method == Method::Image {
+            if commit {
+                self.commit(i);
+            }
+            return;
+        }
         let ex_text = {
             let n = robo::split_list(&job.exclude_files).len() + robo::split_list(&job.exclude_dirs).len();
             if n == 0 { "Nothing".to_string() } else { format!("{n} rule(s)") }
@@ -934,6 +1074,10 @@ impl App {
     fn backups_section(&mut self, ui: &mut egui::Ui, i: usize) {
         let job = self.cfg.jobs[i].clone();
         if !job.is_complete() {
+            return;
+        }
+        if job.method == Method::Image {
+            self.image_versions_section(ui, &job);
             return;
         }
         if job.method != Method::Zip {
@@ -974,7 +1118,7 @@ impl App {
                     } else {
                         ui.label("");
                     }
-                    if ui.add_enabled(!self.busy(), egui::Button::new("Restore…").small())
+                    if ui.add_enabled(!self.busy(), egui::Button::new("Restoreâ€¦").small())
                         .on_hover_text("Unzips this backup into a folder you choose. Nothing existing is overwritten.")
                         .clicked()
                     {
@@ -989,6 +1133,45 @@ impl App {
                 self.start_restore(ui.ctx(), i, zip, PathBuf::from(into));
             }
         }
+    }
+
+    /// Drive image versions on the backup drive, as saved by the last run,
+    /// plus how full the drive is.
+    fn image_versions_section(&mut self, ui: &mut egui::Ui, job: &Job) {
+        let v = store::load_image_versions(&job.id);
+        let d = store::drive_of(&job.dest).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Image versions on {d} ({})", v.versions.len())).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.link("Show drive").clicked() {
+                    open_in_explorer(&format!("{d}\\"));
+                }
+            });
+        });
+        if let Some((free, total)) = image::disk_space(&d) {
+            let used = total.saturating_sub(free);
+            let frac = if total > 0 { used as f32 / total as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(frac).text(format!("{d} {} used Â· {} free of {}", human_bytes(used), human_bytes(free), human_bytes(total))))
+                .on_hover_text(format!("Older versions may use up to {}% of the drive. When that's full, the oldest are deleted first.", job.image_space_pct));
+        }
+        if v.versions.is_empty() {
+            ui.label(RichText::new("No image versions recorded yet. The list is read after each backup.").weak());
+            return;
+        }
+        let now = now();
+        egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::Grid::new(("iv", &job.id)).num_columns(2).striped(true).spacing([16.0, 6.0]).show(ui, |ui| {
+                for (n, s) in v.versions.iter().take(30).enumerate() {
+                    let t = NaiveDateTime::parse_from_str(&format!("{s}:00"), "%Y-%m-%d %H:%M:%S").ok();
+                    ui.label(t.map(|t| list_label(t, now)).unwrap_or_else(|| s.clone()));
+                    ui.label(RichText::new(if n == 0 { "newest" } else if n + 1 == v.versions.len() { "oldest, deleted first" } else { "" }).small().weak());
+                    ui.end_row();
+                }
+            });
+        });
+        let checked = NaiveDateTime::parse_from_str(&v.checked, "%Y-%m-%d %H:%M:%S").ok().map(|t| when_past(t, now)).unwrap_or_default();
+        ui.label(RichText::new(format!("Checked {checked}. To restore: Windows Recovery > Troubleshoot > System Image Recovery, or Disk Management > Attach VHD to get single files out.")).small().weak());
     }
 
     fn history_section(&mut self, ui: &mut egui::Ui, i: usize) {
@@ -1039,7 +1222,7 @@ impl App {
                 }
                 let info = self.tasks.get(&id).cloned().unwrap_or_default();
                 if info.exists {
-                    ui.label(RichText::new(format!("Windows task: next run {} · last run {} (result {}) · {}", info.next_run, info.last_run, info.last_result, info.logon_mode)).small().weak())
+                    ui.label(RichText::new(format!("Windows task: next run {} Â· last run {} (result {}) Â· {}", info.next_run, info.last_run, info.last_result, info.logon_mode)).small().weak())
                         .on_hover_text(&self.cfg.jobs[i].task_name);
                 }
             });
@@ -1065,7 +1248,13 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
-        ui.ctx().request_repaint_after(if self.busy() { Duration::from_millis(100) } else { Duration::from_secs(5) });
+        ui.ctx().request_repaint_after(if self.busy() {
+            Duration::from_millis(100)
+        } else if !self.bg.is_empty() {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(5)
+        });
 
         egui::Panel::left("jobs").resizable(false).default_size(210.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.sidebar(ui));

@@ -14,6 +14,8 @@ pub enum Method {
     Zip,
     Mirror,
     Copy,
+    /// Whole-drive system image with Windows' own wbadmin. Needs admin.
+    Image,
 }
 
 impl Method {
@@ -22,7 +24,19 @@ impl Method {
             Method::Zip => "Dated zip copies",
             Method::Mirror => "Mirror (exact copy)",
             Method::Copy => "Copy, never delete",
+            Method::Image => "Full drive image (Windows Backup)",
         }
+    }
+}
+
+/// "C:", "c:\", "C:\something" -> Some("C:"). Anything else -> None.
+pub fn drive_of(s: &str) -> Option<String> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        Some(format!("{}:", (b[0] as char).to_ascii_uppercase()))
+    } else {
+        None
     }
 }
 
@@ -107,6 +121,9 @@ pub struct Job {
     pub prefix: String,
     pub keep_daily: u32,
     pub keep_weekly: u32,
+    /// Image method: how much of the backup drive older image versions may
+    /// use, in percent. When it's full, Windows deletes the oldest first.
+    pub image_space_pct: u32,
     pub exclude_files: String,
     pub exclude_dirs: String,
     pub robo: RoboOpts,
@@ -126,6 +143,7 @@ impl Default for Job {
             prefix: "Backup".into(),
             keep_daily: 7,
             keep_weekly: 4,
+            image_space_pct: 50,
             exclude_files: String::new(),
             exclude_dirs: String::new(),
             robo: RoboOpts::default(),
@@ -142,6 +160,19 @@ impl Job {
 
     /// Problems that stop a run, in plain words.
     pub fn problem(&self) -> Option<String> {
+        if self.method == Method::Image {
+            let (Some(s), Some(d)) = (drive_of(&self.source), drive_of(&self.dest)) else {
+                return Some(if drive_of(&self.source).is_none() {
+                    "A drive image needs a drive to back up, like C:".into()
+                } else {
+                    "A drive image needs a backup drive, like H:".into()
+                });
+            };
+            if s == d {
+                return Some("The image can't be saved on the drive it's backing up".into());
+            }
+            return None;
+        }
         let s = self.source.trim().trim_end_matches(['\\', '/']).to_lowercase();
         let d = self.dest.trim().trim_end_matches(['\\', '/']).to_lowercase();
         if s.is_empty() {
@@ -315,6 +346,62 @@ pub fn log_tail(id: &str, n: usize) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Live progress of a run, written by whichever process runs the job, so the
+/// window can show a backup that Task Scheduler started in the background.
+pub fn progress_path(id: &str) -> PathBuf {
+    app_dir().join("state").join(format!("{id}.progress"))
+}
+
+pub fn write_progress(id: &str, text: &str) {
+    let _ = write_atomic(&progress_path(id), text.as_bytes());
+}
+
+pub fn clear_progress(id: &str) {
+    let _ = std::fs::remove_file(progress_path(id));
+}
+
+/// The progress text of a run that is going on right now in another process
+/// (the lock is held and recent), if any.
+pub fn background_progress(id: &str) -> Option<String> {
+    let lock = app_dir().join("state").join(format!("{id}.lock"));
+    let lock_age = std::fs::metadata(&lock).ok()?.modified().ok()?.elapsed().ok()?;
+    if lock_age.as_secs() > 12 * 3600 {
+        return None;
+    }
+    // A run that crashed leaves both files behind; a live one keeps
+    // refreshing the progress file.
+    let p = progress_path(id);
+    let fresh = std::fs::metadata(&p).ok()?.modified().ok()?.elapsed().ok()?;
+    if fresh.as_secs() > 3600 {
+        return None;
+    }
+    Some(std::fs::read_to_string(p).unwrap_or_else(|_| "Starting…".into()))
+}
+
+/// Image versions found on the backup drive after the last image run
+/// (listing them needs admin, so the elevated run saves them for the window).
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct ImageVersions {
+    /// When the list was read, "YYYY-MM-DD HH:MM:SS" local time.
+    pub checked: String,
+    /// Backup times, local "YYYY-MM-DD HH:MM", newest first.
+    pub versions: Vec<String>,
+}
+
+pub fn load_image_versions(id: &str) -> ImageVersions {
+    std::fs::read_to_string(app_dir().join("state").join(format!("{id}.versions.json")))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_image_versions(id: &str, v: &ImageVersions) {
+    if let Ok(j) = serde_json::to_string_pretty(v) {
+        let _ = write_atomic(&app_dir().join("state").join(format!("{id}.versions.json")), j.as_bytes());
+    }
+}
+
 /// One run per job at a time (GUI and scheduled task may overlap).
 pub struct RunLock(PathBuf);
 
@@ -364,6 +451,18 @@ mod tests {
         assert!(j.problem().is_none());
         j.dest = r"c:\A\".into();
         assert!(j.problem().is_some());
+    }
+
+    #[test]
+    fn image_problems() {
+        let mut j = Job { method: Method::Image, source: "C:".into(), dest: r"h:\".into(), ..Default::default() };
+        assert!(j.problem().is_none());
+        j.dest = r"C:\Backups".into();
+        assert!(j.problem().is_some());
+        j.dest = r"\\nas\share".into();
+        assert!(j.problem().is_some());
+        assert_eq!(drive_of(r"c:\Users").as_deref(), Some("C:"));
+        assert_eq!(drive_of("x"), None);
     }
 
     #[test]

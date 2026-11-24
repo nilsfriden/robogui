@@ -348,6 +348,103 @@ fn run_robocopy(job: &Job, ctl: &Control, ev: &mut dyn FnMut(Event)) -> Outcome 
 }
 
 // ---------------------------------------------------------------------------
+// Drive image engine (wbadmin)
+// ---------------------------------------------------------------------------
+
+fn run_image(job: &Job, ctl: &Control, ev: &mut dyn FnMut(Event)) -> Outcome {
+    use crate::image;
+    if !image::is_elevated() {
+        return Outcome::fail("A drive image needs administrator rights. Let the schedule run it, or open RoboGUI as administrator.");
+    }
+    let (Some(src), Some(dst)) = (store::drive_of(&job.source), store::drive_of(&job.dest)) else {
+        return Outcome::fail("Choose a drive to back up and a backup drive");
+    };
+    let mut warnings = 0;
+
+    // Cap the space older versions may use. When it's full, Windows deletes
+    // the oldest versions first: that's what keeps the backups recent.
+    ev(Event::Phase("Setting space for older versions…".into()));
+    let pct = job.image_space_pct;
+    let mut out = Vec::new();
+    let mut code = run_process(ctl, "vssadmin.exe", &image::shadow_args("Resize", &dst, pct), &mut |l| out.push(l.to_string()));
+    if code != 0 && !ctl.stopped() {
+        out.clear();
+        code = run_process(ctl, "vssadmin.exe", &image::shadow_args("Add", &dst, pct), &mut |l| out.push(l.to_string()));
+    }
+    if ctl.stopped() {
+        return Outcome::fail("Stopped");
+    }
+    if code == 0 {
+        ev(Event::Line(format!("Older versions on {dst} may use up to {pct}% of the drive")));
+    } else {
+        warnings += 1;
+        ev(Event::Line(format!("WARN: couldn't set the space limit for older versions on {dst} (vssadmin code {code})")));
+        for l in out.iter().filter(|l| !l.trim().is_empty()).take(5) {
+            ev(Event::Line(format!("WARN: {l}")));
+        }
+    }
+
+    ev(Event::Phase(format!("Creating the image of {src}…")));
+    ev(Event::Total { files: 0, bytes: 100 });
+    let args = image::wbadmin_args(&src, &dst);
+    ev(Event::Line(format!("wbadmin {}", args.join(" "))));
+    let mut last_logged_pct: Option<u64> = None;
+    let mut last_text = String::new();
+    let code = run_process(ctl, "wbadmin.exe", &args, &mut |l| {
+        let l = l.trim();
+        if l.is_empty() {
+            return;
+        }
+        if let Some(p) = image::parse_percent(l) {
+            ev(Event::Phase(image::progress_phase(l)));
+            ev(Event::Progress { files: 0, bytes: p });
+            // Log every 10 % so the log shows it moving without thousands of lines.
+            if last_logged_pct.is_none_or(|q| p / 10 != q / 10 || p < q) {
+                last_logged_pct = Some(p);
+                ev(Event::Line(l.to_string()));
+            }
+        } else {
+            last_text = l.to_string();
+            ev(Event::Line(l.to_string()));
+        }
+    });
+    if ctl.stopped() || code < 0 {
+        return Outcome::fail(if ctl.stopped() { "Stopped".to_string() } else { "Couldn't start Windows Backup (wbadmin)".to_string() });
+    }
+    if code != 0 {
+        let why = if last_text.is_empty() { String::new() } else { format!(": {last_text}") };
+        return Outcome::fail(format!("Windows Backup failed (code {code}){why}"));
+    }
+
+    // What's on the backup drive now. Reading it needs admin, so save it for
+    // the window (which usually runs without admin).
+    ev(Event::Phase(format!("Checking the versions on {dst}…")));
+    let mut text = String::new();
+    run_process(ctl, "wbadmin.exe", &["get".into(), "versions".into(), format!("-backupTarget:{dst}")], &mut |l| {
+        text.push_str(l);
+        text.push('\n');
+    });
+    let versions = image::parse_versions(&text);
+    store::save_image_versions(
+        &job.id,
+        &store::ImageVersions {
+            checked: Local::now().naive_local().format("%Y-%m-%d %H:%M:%S").to_string(),
+            versions: versions.iter().map(|t| t.format("%Y-%m-%d %H:%M").to_string()).collect(),
+        },
+    );
+    let size = image::folder_size(&PathBuf::from(format!("{dst}\\WindowsImageBackup")));
+    let free = image::disk_space(&dst).map(|(f, _)| format!(" · {} free on {dst}", human_bytes(f))).unwrap_or_default();
+    ev(Event::Line(format!("{} version(s) on {dst}, images use {}{free}", versions.len(), human_bytes(size))));
+
+    let message = if warnings > 0 {
+        "Image saved, but the space limit for older versions couldn't be set. Open Details to see why.".to_string()
+    } else {
+        format!("Image saved · {} version(s) on {dst}{free}", versions.len())
+    };
+    Outcome { ok: true, warnings, message, size }
+}
+
+// ---------------------------------------------------------------------------
 // Run wrapper
 // ---------------------------------------------------------------------------
 
@@ -363,17 +460,38 @@ pub fn execute(job: &Job, scheduled: bool, ctl: &Control, ev: &mut dyn FnMut(Eve
         job.name
     )];
 
+    // Progress also goes to a small file, so the window can show runs that
+    // Task Scheduler started in the background.
+    let id = job.id.clone();
+    store::write_progress(&id, "Starting…");
+    let (mut phase, mut total, mut done) = (String::from("Starting…"), 0u64, 0u64);
+    let mut last_write = std::time::Instant::now();
     let outcome = {
         let mut tee = |e: Event| {
-            if let Event::Line(l) = &e {
-                if log.len() < 3000 {
-                    log.push(l.clone());
+            let mut write_now = false;
+            match &e {
+                Event::Line(l) => {
+                    if log.len() < 3000 {
+                        log.push(l.clone());
+                    }
                 }
+                Event::Phase(p) => {
+                    write_now = *p != phase;
+                    phase = p.clone();
+                }
+                Event::Total { bytes, .. } => total = *bytes,
+                Event::Progress { bytes, .. } => done = *bytes,
+            }
+            if write_now || last_write.elapsed() >= Duration::from_secs(2) {
+                last_write = std::time::Instant::now();
+                let text = if total > 0 { format!("{phase} {}%", (done * 100 / total).min(100)) } else { phase.clone() };
+                store::write_progress(&id, &text);
             }
             ev(e);
         };
         run_inner(job, scheduled, ctl, &mut tee)
     };
+    store::clear_progress(&id);
 
     let rec = RunRecord {
         finished: Local::now().naive_local().format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -415,6 +533,7 @@ fn run_inner(job: &Job, scheduled: bool, ctl: &Control, ev: &mut dyn FnMut(Event
     match job.method {
         Method::Zip => run_zip(job, ctl, ev),
         Method::Mirror | Method::Copy => run_robocopy(job, ctl, ev),
+        Method::Image => run_image(job, ctl, ev),
     }
 }
 

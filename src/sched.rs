@@ -2,7 +2,7 @@
 //! schedule maths used for "next backup" and missed-run detection.
 
 use crate::runner::{decode_console, hidden_command};
-use crate::store::{sanitize, Job, Repeat, Schedule};
+use crate::store::{sanitize, Job, Method, Repeat, Schedule};
 use chrono::{Datelike, Duration, NaiveDateTime, NaiveTime};
 
 /// Parse "HH:MM" (24 h). Returns normalised "HH:MM".
@@ -75,7 +75,8 @@ pub enum Logon {
     Interactive,
 }
 
-pub fn task_xml(user: &str, s: &Schedule, logon: Logon, command: &str, arguments: &str, description: &str) -> String {
+pub fn task_xml(user: &str, s: &Schedule, logon: Logon, highest: bool, command: &str, arguments: &str, description: &str) -> String {
+    let run_level = if highest { "HighestAvailable" } else { "LeastPrivilege" };
     let time = parse_time(&s.time).unwrap_or_else(|| "04:00".into());
     let schedule = match s.repeat {
         Repeat::Daily => "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>".to_string(),
@@ -105,7 +106,7 @@ pub fn task_xml(user: &str, s: &Schedule, logon: Logon, command: &str, arguments
     <Principal id="Author">
       <UserId>{user}</UserId>
       <LogonType>{logon_type}</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
+      <RunLevel>{run_level}</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -188,14 +189,27 @@ pub fn install(job: &Job) -> Result<(String, Logon), String> {
     let desc = format!("RoboGUI backup job \"{}\". Managed by RoboGUI; change it in the app.", job.name);
     let name = task_name_for(job);
     let user = current_user();
-    let bg = create_with(&name, &task_xml(&user, &job.schedule, Logon::Background, &exe, &args, &desc));
+    // Drive images (wbadmin) need administrator rights, so their task runs
+    // with the highest rights the user has. Windows only lets an elevated
+    // program create such a task.
+    let highest = job.method == Method::Image;
+    let bg = create_with(&name, &task_xml(&user, &job.schedule, Logon::Background, highest, &exe, &args, &desc));
     match bg {
         Ok(()) => Ok((name, Logon::Background)),
-        Err(e1) => match create_with(&name, &task_xml(&user, &job.schedule, Logon::Interactive, &exe, &args, &desc)) {
+        Err(e1) => match create_with(&name, &task_xml(&user, &job.schedule, Logon::Interactive, highest, &exe, &args, &desc)) {
             Ok(()) => Ok((name, Logon::Interactive)),
+            Err(e2) if highest && !crate::image::is_elevated() => Err(format!(
+                "Scheduling a drive image needs administrator rights. Press \"Open as administrator\" and save the schedule again there.\n{e2}"
+            )),
             Err(e2) => Err(format!("Windows didn't accept the scheduled task.\n{e1}\n{e2}")),
         },
     }
+}
+
+/// Start a job's scheduled task right now (runs in the background with the
+/// task's rights, so a drive image works from a window without admin).
+pub fn run_now(name: &str) -> Result<(), String> {
+    run_schtasks(&["/Run", "/TN", name]).map(|_| ())
 }
 
 pub fn delete(name: &str) -> Result<(), String> {
@@ -324,10 +338,13 @@ mod tests {
     #[test]
     fn xml() {
         let s = Schedule { enabled: true, time: "4:00".into(), repeat: Repeat::Weekly(Weekday::Sunday), enabled_at: String::new() };
-        let x = task_xml(r"PC\Nils", &s, Logon::Background, r"C:\dev\robogui.exe", "--run ab12 & x", "d");
+        let x = task_xml(r"PC\Nils", &s, Logon::Background, false, r"C:\dev\robogui.exe", "--run ab12 & x", "d");
         assert!(x.contains("<StartBoundary>2025-01-01T04:00:00</StartBoundary>"));
         assert!(x.contains("<Sunday />") && x.contains("<LogonType>S4U</LogonType>"));
         assert!(x.contains("--run ab12 &amp; x"));
+        assert!(x.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        let x = task_xml(r"PC\Nils", &s, Logon::Background, true, "r.exe", "", "d");
+        assert!(x.contains("<RunLevel>HighestAvailable</RunLevel>"));
     }
 
     #[test]
