@@ -832,7 +832,7 @@ impl App {
                             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                                 ui.add(egui::Label::new(RichText::new(&head).color(fg)).wrap());
                                 for l in &rest {
-                                    ui.add(egui::Label::new(RichText::new(l).color(fg.gamma_multiply(0.75)).size(12.5)).wrap());
+                                    ui.add(egui::Label::new(RichText::new(*l).color(fg.gamma_multiply(0.75)).size(12.5)).wrap());
                                 }
                             });
                         });
