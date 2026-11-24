@@ -1,6 +1,6 @@
 [package]
 name = "robogui"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT"
 description = "Folder backup tool: dated zip copies, robocopy mirrors or full drive images, scheduled with Task Scheduler"

@@ -1,4 +1,4 @@
-// RoboGUI v0.3.1 - folder backup tool with scheduled background runs.
+// RoboGUI v0.3.2 - folder backup tool with scheduled background runs.
 //
 //   robogui.exe              opens the window
 //   robogui.exe --run <id>   runs one backup job without a window
@@ -247,6 +247,10 @@ struct App {
     /// Jobs whose scheduled task starts another copy of RoboGUI: job id ->
     /// the command the task runs now.
     stale: HashMap<String, String>,
+    /// Job whose Fix needs administrator rights.
+    fix_admin: Option<String>,
+    /// When to look at the tasks again after an admin fix.
+    recheck_at: Option<Instant>,
 }
 
 impl App {
@@ -275,6 +279,8 @@ impl App {
             elevated: image::is_elevated(),
             bg: HashMap::new(),
             stale: HashMap::new(),
+            fix_admin: None,
+            recheck_at: None,
         };
         app.reload_states();
         app.check_tasks();
@@ -314,15 +320,63 @@ impl App {
     }
 
     /// "Fix": register job `i`'s task again so it starts this program.
+    /// A task made with administrator rights can only be changed with them;
+    /// then the user gets "Fix as administrator" (see `fix_as_admin`).
     fn fix_task(&mut self, i: usize) {
         self.notice = None;
         self.commit(i);
         let id = self.cfg.jobs[i].id.clone();
-        if self.tasks.get(&id).is_some_and(|t| t.exists) && !matches!(self.notice, Some((Tone::Error, _))) {
+        let failed = matches!(self.notice, Some((Tone::Error, _)));
+        if failed && !self.elevated {
+            let details = self.notice.take().map(|(_, t)| t).unwrap_or_default();
+            self.fix_admin = Some(id);
+            self.notice = Some((
+                Tone::Warn,
+                format!("This task was set up with administrator rights, so fixing it needs them too.\nPress Fix as administrator; Windows asks for permission first.\n{details}"),
+            ));
+            return;
+        }
+        if !failed && self.tasks.get(&id).is_some_and(|t| t.exists) {
             self.stale.remove(&id);
             if self.notice.is_none() {
                 self.notice = Some((Tone::Ok, "Scheduled task fixed: it now starts this copy of RoboGUI.".into()));
             }
+        }
+    }
+
+    /// Run `robogui.exe --fix <id>` with administrator rights, then look at
+    /// the task again a few seconds later.
+    fn fix_as_admin(&mut self, i: usize) {
+        let id = self.cfg.jobs[i].id.clone();
+        self.save();
+        if image::relaunch_as_admin(&format!("--fix {id}")) {
+            self.notice = Some((Tone::Neutral, "Fixing the scheduled task with administrator rights…".into()));
+            self.recheck_at = Some(Instant::now() + Duration::from_secs(3));
+        } else {
+            self.notice = Some((Tone::Warn, "Windows didn't give administrator rights, so the task wasn't changed.".into()));
+        }
+    }
+
+    /// After an admin fix: re-read the jobs file (the elevated copy updated
+    /// it) and the tasks, and say how it went.
+    fn finish_admin_fix(&mut self) {
+        self.recheck_at = None;
+        let disk = store::load_config();
+        for j in self.cfg.jobs.iter_mut() {
+            if let Some(d) = disk.jobs.iter().find(|d| d.id == j.id) {
+                j.task_name = d.task_name.clone();
+            }
+        }
+        self.check_tasks();
+        if let Some(id) = self.fix_admin.take() {
+            let ok = !self.stale.contains_key(&id) && self.tasks.get(&id).is_some_and(|t| t.exists);
+            self.notice = Some(if ok {
+                (Tone::Ok, "Scheduled task fixed: it now starts this copy of RoboGUI.".into())
+            } else {
+                self.fix_admin = Some(id.clone());
+                let last = store::log_tail(&id, 1).pop().unwrap_or_default();
+                (Tone::Error, format!("The task still isn't fixed.\n{last}"))
+            });
         }
     }
 
@@ -421,6 +475,9 @@ impl App {
 
     fn poll(&mut self) {
         // Pick up runs finished by the scheduler while the window is open.
+        if self.recheck_at.is_some_and(|t| Instant::now() >= t) {
+            self.finish_admin_fix();
+        }
         let every = if self.bg.is_empty() { 5 } else { 2 };
         if self.last_poll.elapsed() > Duration::from_secs(every) {
             self.last_poll = Instant::now();
@@ -628,6 +685,7 @@ impl App {
         let st = job_status(job, self.states.get(&job.id).unwrap_or(&State::default()), self.tasks.get(&job.id), self.stale.get(&job.id), now);
         let needs_fix = job.schedule.enabled && job.is_complete() && (self.stale.contains_key(&job.id) || self.tasks.get(&job.id).is_some_and(|t| !t.exists));
         let mut fix = false;
+        let mut fix_admin = false;
         let tone = if running.is_some() || background.is_some() { Tone::Neutral } else { st.tone };
         let (bg, fg) = tone_colors(tone, dark);
         let can_run = job.problem().is_none() && !self.busy() && background.is_none();
@@ -669,29 +727,37 @@ impl App {
                 }
                 ui.label(RichText::new("Started by Windows Task Scheduler. You can close RoboGUI; the result shows up here when it's done.").color(fg).size(12.5));
             } else {
+                // Text gets the full width; the buttons sit on their own row
+                // below it, so long messages never run under them.
+                ui.label(RichText::new(&st.title).color(fg).size(17.0).strong());
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(&st.detail).color(fg)).wrap());
+                if !st.scheduled.is_empty() {
+                    ui.label(RichText::new(&st.scheduled).color(fg.gamma_multiply(0.8)).size(13.0))
+                        .on_hover_text("Runs started by Windows Task Scheduler in the background, read from the job's run history.");
+                }
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&st.title).color(fg).size(16.0).strong());
-                        ui.label(RichText::new(&st.detail).color(fg));
-                        if !st.scheduled.is_empty() {
-                            ui.label(RichText::new(&st.scheduled).color(fg).size(13.0))
-                                .on_hover_text("Runs started by Windows Task Scheduler in the background, read from the job's run history.");
+                    let size = egui::vec2(0.0, 30.0);
+                    if needs_fix {
+                        let admin = self.fix_admin.as_deref() == Some(job.id.as_str());
+                        let (label, hover) = if admin {
+                            ("Fix as administrator", "Windows asks for permission, then the task is registered again so it starts this copy of RoboGUI.")
+                        } else {
+                            ("Fix", "Registers this job's scheduled task in Windows again, so it starts this copy of RoboGUI.")
+                        };
+                        let b = egui::Button::new(RichText::new(label).strong().color(bg)).fill(fg).min_size(size);
+                        if ui.add_enabled(!self.busy(), b).on_hover_text(hover).clicked() {
+                            if admin {
+                                fix_admin = true;
+                            } else {
+                                fix = true;
+                            }
                         }
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let b = ui.add_enabled(can_run, egui::Button::new("Back up now").min_size(egui::vec2(110.0, 30.0)));
-                        if b.clicked() {
-                            start = true;
-                        }
-                        if needs_fix
-                            && ui
-                                .add_enabled(!self.busy(), egui::Button::new("Fix").min_size(egui::vec2(60.0, 30.0)))
-                                .on_hover_text("Registers this job's scheduled task in Windows again, so it starts this copy of RoboGUI.")
-                                .clicked()
-                        {
-                            fix = true;
-                        }
-                    });
+                    }
+                    if ui.add_enabled(can_run, egui::Button::new("Back up now").min_size(size)).clicked() {
+                        start = true;
+                    }
                 });
             }
         });
@@ -700,6 +766,9 @@ impl App {
         }
         if fix {
             self.fix_task(i);
+        }
+        if fix_admin {
+            self.fix_as_admin(i);
         }
         if stop {
             if let Some(r) = &self.run {
@@ -727,7 +796,7 @@ impl App {
                 ui.label(RichText::new(text).weak());
                 if ui.button("Open as administrator").clicked() {
                     self.save();
-                    if image::relaunch_as_admin() {
+                    if image::relaunch_as_admin("") {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     } else {
                         self.notice = Some((Tone::Warn, "Windows didn't start RoboGUI as administrator.".into()));
@@ -736,13 +805,39 @@ impl App {
             });
         }
         if let Some((tone, text)) = self.notice.clone() {
-            let (_, fg) = tone_colors(tone, ui.visuals().dark_mode);
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(fg, text);
-                if ui.small_button("Dismiss").clicked() {
-                    self.notice = None;
+            // First line is the message; further lines are technical details.
+            let (bg, fg) = tone_colors(tone, ui.visuals().dark_mode);
+            let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+            let head = lines.next().unwrap_or_default().to_string();
+            let mut rest: Vec<&str> = Vec::new();
+            for l in lines.map(|l| l.trim().trim_start_matches("ERROR: ")) {
+                if !rest.contains(&l) {
+                    rest.push(l);
                 }
-            });
+            }
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(bg.gamma_multiply(0.6))
+                .stroke(egui::Stroke::new(1.0, fg.gamma_multiply(0.35)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            if ui.link("Dismiss").clicked() {
+                                self.notice = None;
+                            }
+                            ui.add_space(8.0);
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.add(egui::Label::new(RichText::new(&head).color(fg)).wrap());
+                                for l in &rest {
+                                    ui.add(egui::Label::new(RichText::new(l).color(fg.gamma_multiply(0.75)).size(12.5)).wrap());
+                                }
+                            });
+                        });
+                    });
+                });
         }
         if let Some(p) = self.restored.clone() {
             let is_resolve = self.cfg.jobs[i].source.contains("Resolve");
@@ -1290,8 +1385,8 @@ impl eframe::App for App {
         self.poll();
         ui.ctx().request_repaint_after(if self.busy() {
             Duration::from_millis(100)
-        } else if !self.bg.is_empty() {
-            Duration::from_secs(1)
+        } else if !self.bg.is_empty() || self.recheck_at.is_some() {
+            Duration::from_millis(500)
         } else {
             Duration::from_secs(5)
         });
@@ -1335,8 +1430,29 @@ fn run_headless(id: &str) -> i32 {
     }
 }
 
+/// `robogui.exe --fix <id>` (started with administrator rights by the
+/// window's "Fix as administrator"): register the job's task again so it
+/// starts this exe.
+fn fix_headless(id: &str) -> i32 {
+    let mut cfg = store::load_config();
+    let Some(job) = cfg.jobs.iter_mut().find(|j| j.id == id) else { return 2 };
+    let res = sched::sync(job);
+    let _ = store::save_config(&cfg);
+    let when = now().format("%Y-%m-%d %H:%M:%S");
+    let line = match &res {
+        Ok(_) => format!("{when} Fix: scheduled task registered again for this copy of RoboGUI"),
+        Err(e) => format!("{when} Fix failed: {}", e.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or(e)),
+    };
+    store::append_log(id, &[line]);
+    if res.is_ok() { 0 } else { 1 }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--fix") {
+        let code = args.get(pos + 1).map(|id| fix_headless(id)).unwrap_or(2);
+        std::process::exit(code);
+    }
     if let Some(pos) = args.iter().position(|a| a == "--run") {
         let code = args.get(pos + 1).map(|id| run_headless(id)).unwrap_or(2);
         std::process::exit(code);

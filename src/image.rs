@@ -94,21 +94,23 @@ pub fn is_elevated() -> bool {
 }
 
 /// Start this program again with administrator rights (Windows asks the user
-/// first). Returns true if the new copy started.
+/// first), with `args` ("" for the normal window). Returns true if it started.
 #[cfg(windows)]
-pub fn relaunch_as_admin() -> bool {
+pub fn relaunch_as_admin(args: &str) -> bool {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     let Ok(exe) = std::env::current_exe() else { return false };
     let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
     let verb = wide("runas");
     let file = wide(&exe.to_string_lossy());
-    let r = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+    let params = wide(args);
+    let p = if args.is_empty() { std::ptr::null() } else { params.as_ptr() };
+    let r = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), p, std::ptr::null(), SW_SHOWNORMAL) };
     r as usize > 32
 }
 
 #[cfg(not(windows))]
-pub fn relaunch_as_admin() -> bool {
+pub fn relaunch_as_admin(_args: &str) -> bool {
     false
 }
 

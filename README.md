@@ -1,4 +1,4 @@
-# RoboGUI v0.3.1
+# RoboGUI v0.3.2
 
 A folder backup tool for Windows (Rust + egui). Each backup job is a folder,
 a destination, a method, a schedule and a rule for what to keep. Scheduled
